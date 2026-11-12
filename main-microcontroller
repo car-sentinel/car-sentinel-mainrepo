@@ -2,8 +2,6 @@
 #include <WiFi.h>
 #include <esp_now.h>
 
-// Runs when a wireless packet arrives
-
 void setupWifi() {
 // Set up Wifi connection
 // Verify connection

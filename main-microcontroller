@@ -2,13 +2,14 @@
 #include <WiFi.h>
 #include <esp_now.h>
 
-void setupWifi() {
+int setupWifi() {
 // Set up Wifi connection
-// Verify connection
+// Return working/not working messgae
 }
 
-int startUpScreen() {
-// Sends packet to screen so it starts up
+int startUpScreen(startupInformation) {
+// Sends packet of [startupInformation] to screen so it starts up
+// Return working/not working messgae
 }
 
 int testSensors() {
@@ -43,7 +44,7 @@ int testSensors() {
 
 void setup() {
   setupWifi();
-  startupScreen();
+  startupScreen(startupInformation);
   testSensors();
 }
 

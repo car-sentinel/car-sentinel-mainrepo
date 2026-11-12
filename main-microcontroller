@@ -1,1 +1,59 @@
-#blank space for the main esp's code
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+// Runs when a wireless packet arrives
+
+void setupWifi() {
+// Set up Wifi connection
+// Verify connection
+}
+
+int startUpScreen() {
+// Sends packet to screen so it starts up
+}
+
+int testSensors() {
+  // Tests to ensure sensors are working properly
+  // Return working/not working messgae
+}
+
+[something] packageSensor1Data() {
+  // packages sensor data to transmit to screen esp
+}
+
+[something] packageSensor2Data() {
+  // packages sensor data to transmit to screen esp
+}
+
+[something] packageSensor3Data() {
+  // packages sensor data to transmit to screen esp
+}
+
+[something] packageSensor4Data() {
+  // packages sensor data to transmit to screen esp
+}
+
+[something] packageSensor5Data() {
+  // packages sensor data to transmit to screen esp
+}
+
+[something] sendData(flag) {
+  // updates screen by sending data over
+  // sends flag if needed
+}
+
+void setup() {
+  setupWifi();
+  startupScreen();
+  testSensors();
+}
+
+void loop() {
+  packageSensor1Data();
+  packageSensor2Data();
+  packageSensor3Data();
+  packageSensor4Data();
+  packageSensor5Data();
+  sendData(flag);
+}

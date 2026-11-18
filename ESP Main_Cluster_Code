@@ -1,0 +1,264 @@
+// =========================================================================
+// PROJECT SENTINEL — MAIN SENSOR MCU (ESP32-S3)
+// Samples 5 automotive channels every 60 ms & streams binary packets over BLE
+// Tachometer uses microsecond period measurement for rock-solid RPM
+// =========================================================================
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <math.h>
+
+// -------------------- PIN ASSIGNMENTS --------------------
+#define PIN_TEMP 1   // Bosch NTC Coolant Temp (with 2.2k pull-up to 3.3V)
+#define PIN_OIL  2   // Bosch 0.5-4.5V Oil Pressure (through voltage divider)
+#define PIN_AFR  3   // AEM Bosch 4.9 Analog Out (through voltage divider)
+#define PIN_VOLT 4   // Battery Voltage Divider
+#define PIN_TACH 5   // Opto-isolated V8 Tachometer Pulse Input (digital ISR)
+#define PIN_OSC  10  // 60ms Loop Cycle Verification Output (for oscilloscope)
+
+// -------------------- HARDWARE CALIBRATION --------------------
+// 1. Coolant Temp (Bosch NTC 0 280 130 026 Steinhart-Hart)
+const float VCC_ADC         = 3.30f;
+const float R_TEMP_PULLUP   = 2200.0f; // Change to your exact pull-up resistor (Ohms)
+const float SH_A            = 1.28890154e-03f;
+const float SH_B            = 2.61915408e-04f;
+const float SH_C            = 1.49952130e-07f;
+
+// 2. Oil Pressure (Bosch 0-10 bar / 0-145 PSI, 0.5V to 4.5V output)
+//    Voltage divider: 10k top / 20k bottom -> scale = (10k + 20k) / 20k = 1.5
+const float OIL_DIV_SCALE   = 1.50f;
+const float OIL_MAX_PSI     = 145.0f;  // Change to 100.0f if using a 0-100 PSI Bosch sensor
+
+// 3. Air-Fuel Ratio (AEM Bosch LSU 4.9)
+//    Set AEM_X_SERIES to true for 30-0300 (0.5V=8.5, 4.5V=18.0)
+//    Set AEM_X_SERIES to false for 30-4110 (0.0V=10.0, 5.0V=20.0)
+const bool  AEM_X_SERIES    = true;
+const float AFR_DIV_SCALE   = 1.50f;   // 10k top / 20k bottom (use 1.667 for 10k/15k)
+
+// 4. Battery Voltage Divider (30k top / 7.5k bottom -> 5.0x scale)
+const float BATT_DIV_SCALE  = 5.00f;
+
+// 5. V8 Tachometer Circuit (4N35 + CD4017B + P2N2222)
+const float TACH_DIVIDER    = 10.0f;   // Set to your CD4017 division ratio (e.g., 10, 4, or 1)
+const float PULSES_PER_REV  = 4.0f;    // 4-stroke V8 = 4 ignition pulses per revolution
+
+// -------------------- BLE UUIDs --------------------
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+// -------------------- SEVERITY STATUS CODES --------------------
+enum SensorStatus : uint8_t {
+  STATUS_OK    = 0,  // Nominal (dark card)
+  STATUS_WARN  = 1,  // Warning threshold (yellow card)
+  STATUS_ALARM = 2,  // Critical alarm (red card)
+  STATUS_FAULT = 3   // Wire disconnect / out-of-range (yellow card + "---")
+};
+
+// Packed 28-byte binary telemetry packet (must match Slave exactly)
+struct __attribute__((packed)) TelemetryPacket {
+  uint32_t seq;
+  float    coolantF;
+  float    oilPsi;
+  float    afr;
+  float    battV;
+  uint16_t rpm;
+  uint8_t  stTemp;
+  uint8_t  stOil;
+  uint8_t  stAfr;
+  uint8_t  stBatt;
+  uint8_t  stRpm;
+  uint8_t  reserved;
+};
+
+// -------------------- GLOBALS --------------------
+BLECharacteristic* pTelemetryChar = nullptr;
+bool deviceConnected = false;
+
+const unsigned long LOOP_PERIOD_MS = 60;
+unsigned long lastLoopMs = 0;
+bool oscState = false;
+uint32_t packetSeq = 0;
+
+// Tachometer ISR variables (Period Measurement)
+volatile uint32_t lastPulseUs   = 0;
+volatile uint32_t pulsePeriodUs = 0;
+float filteredRpm = 0.0f;
+
+void IRAM_ATTR onTachPulse() {
+  uint32_t now = micros();
+  uint32_t dt = now - lastPulseUs;
+  if (dt > 500) { // 500 us debounce against ignition ringing
+    pulsePeriodUs = dt;
+    lastPulseUs = now;
+  }
+}
+
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    deviceConnected = true;
+    Serial.println("[BLE] Display connected.");
+  }
+  void onDisconnect(BLEServer* pServer) override {
+    deviceConnected = false;
+    Serial.println("[BLE] Display disconnected. Restarting advertising...");
+    BLEDevice::startAdvertising();
+  }
+};
+
+// Helper: Multi-sample ADC average to reject automotive noise
+float readAdcVolts(uint8_t pin, uint8_t samples = 8) {
+  uint32_t sumMv = 0;
+  for (uint8_t i = 0; i < samples; i++) {
+    sumMv += analogReadMilliVolts(pin);
+  }
+  return (sumMv / (float)samples) / 1000.0f;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_OSC, OUTPUT);
+  digitalWrite(PIN_OSC, LOW);
+
+  pinMode(PIN_TEMP, INPUT);
+  pinMode(PIN_OIL,  INPUT);
+  pinMode(PIN_AFR,  INPUT);
+  pinMode(PIN_VOLT, INPUT);
+  pinMode(PIN_TACH, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIN_TACH), onTachPulse, RISING);
+
+  // Initialize BLE Server
+  BLEDevice::init("Sentinel_MCU");
+  BLEServer* pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+  pTelemetryChar = pService->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+  );
+  pTelemetryChar->addDescriptor(new BLE2902());
+  pService->start();
+
+  BLEAdvertising* pAdv = BLEDevice::getAdvertising();
+  pAdv->addServiceUUID(SERVICE_UUID);
+  pAdv->setScanResponse(true);
+  pAdv->setMinPreferred(0x06); // Fast reconnect intervals
+  BLEDevice::startAdvertising();
+
+  Serial.println("=== PROJECT SENTINEL MAIN MCU READY ===");
+}
+
+void loop() {
+  unsigned long nowMs = millis();
+  if (nowMs - lastLoopMs < LOOP_PERIOD_MS) return;
+  lastLoopMs = nowMs;
+
+  // Toggle GPIO 10 for 60ms oscilloscope verification
+  oscState = !oscState;
+  digitalWrite(PIN_OSC, oscState);
+
+  TelemetryPacket pkt = {};
+  pkt.seq = ++packetSeq;
+
+  // -----------------------------------------------------------------------
+  // 1. COOLANT TEMP (Bosch NTC Thermistor)
+  // -----------------------------------------------------------------------
+  float vTemp = readAdcVolts(PIN_TEMP);
+  if (vTemp < 0.05f || vTemp > (VCC_ADC - 0.05f)) {
+    pkt.coolantF = 0.0f;
+    pkt.stTemp = STATUS_FAULT;
+  } else {
+    float rNtc = R_TEMP_PULLUP * (vTemp / (VCC_ADC - vTemp));
+    float lnR = logf(rNtc);
+    float tempK = 1.0f / (SH_A + SH_B * lnR + SH_C * lnR * lnR * lnR);
+    pkt.coolantF = (tempK - 273.15f) * 9.0f / 5.0f + 32.0f;
+
+    if (pkt.coolantF > 240.0f)      pkt.stTemp = STATUS_ALARM;
+    else if (pkt.coolantF > 215.0f) pkt.stTemp = STATUS_WARN;
+    else                            pkt.stTemp = STATUS_OK;
+  }
+
+  // -----------------------------------------------------------------------
+  // 2. OIL PRESSURE (Bosch 0.5V - 4.5V Linear Transducer)
+  // -----------------------------------------------------------------------
+  float vOilSensor = readAdcVolts(PIN_OIL) * OIL_DIV_SCALE;
+  if (vOilSensor < 0.30f || vOilSensor > 4.75f) {
+    pkt.oilPsi = 0.0f;
+    pkt.stOil = STATUS_FAULT;
+  } else {
+    float psi = ((vOilSensor - 0.50f) / 4.00f) * OIL_MAX_PSI;
+    pkt.oilPsi = constrain(psi, 0.0f, OIL_MAX_PSI);
+
+    if (pkt.oilPsi < 15.0f)      pkt.stOil = STATUS_ALARM;
+    else if (pkt.oilPsi < 22.0f) pkt.stOil = STATUS_WARN;
+    else                         pkt.stOil = STATUS_OK;
+  }
+
+  // -----------------------------------------------------------------------
+  // 3. AIR-FUEL RATIO (AEM Bosch LSU 4.9 Controller)
+  // -----------------------------------------------------------------------
+  float vAfrSensor = readAdcVolts(PIN_AFR) * AFR_DIV_SCALE;
+  if (vAfrSensor < 0.15f || vAfrSensor > 4.95f) {
+    pkt.afr = 0.0f;
+    pkt.stAfr = STATUS_FAULT;
+  } else {
+    if (AEM_X_SERIES) {
+      // AEM 30-0300 X-Series: 0.5V = 8.5 AFR, 4.5V = 18.0 AFR
+      pkt.afr = 2.375f * vAfrSensor + 7.3125f;
+    } else {
+      // AEM 30-4110 Classic UEGO: 0.0V = 10.0 AFR, 5.0V = 20.0 AFR
+      pkt.afr = 2.000f * vAfrSensor + 10.0f;
+    }
+
+    if (pkt.afr < 10.5f || pkt.afr > 17.5f)      pkt.stAfr = STATUS_ALARM;
+    else if (pkt.afr < 11.5f || pkt.afr > 16.0f) pkt.stAfr = STATUS_WARN;
+    else                                         pkt.stAfr = STATUS_OK;
+  }
+
+  // -----------------------------------------------------------------------
+  // 4. BATTERY VOLTAGE (Voltage Divider)
+  // -----------------------------------------------------------------------
+  float vBatt = readAdcVolts(PIN_VOLT) * BATT_DIV_SCALE;
+  if (vBatt < 3.0f) {
+    pkt.battV = 0.0f;
+    pkt.stBatt = STATUS_FAULT;
+  } else {
+    pkt.battV = vBatt;
+    if (pkt.battV < 11.2f || pkt.battV > 15.5f)      pkt.stBatt = STATUS_ALARM;
+    else if (pkt.battV < 12.0f || pkt.battV > 15.0f) pkt.stBatt = STATUS_WARN;
+    else                                             pkt.stBatt = STATUS_OK;
+  }
+
+  // -----------------------------------------------------------------------
+  // 5. TACHOMETER (Period-Based RPM Calculation)
+  // -----------------------------------------------------------------------
+  noInterrupts();
+  uint32_t periodUs = pulsePeriodUs;
+  uint32_t lastUs   = lastPulseUs;
+  interrupts();
+
+  float instantRpm = 0.0f;
+  // Engine is spinning if a pulse arrived within the last 0.5 seconds
+  if (periodUs > 0 && (micros() - lastUs) < 500000UL) {
+    float pulsesPerSec = 1000000.0f / (float)periodUs;
+    instantRpm = (pulsesPerSec * 60.0f * TACH_DIVIDER) / PULSES_PER_REV;
+  }
+
+  // Smooth out any minor edge jitter
+  filteredRpm = (0.30f * instantRpm) + (0.70f * filteredRpm);
+  if (filteredRpm < 50.0f) filteredRpm = 0.0f;
+  pkt.rpm = (uint16_t)constrain(filteredRpm, 0.0f, 7000.0f);
+
+  if (pkt.rpm > 5500)      pkt.stRpm = STATUS_ALARM;
+  else if (pkt.rpm > 5000) pkt.stRpm = STATUS_WARN;
+  else                     pkt.stRpm = STATUS_OK;
+
+  // -----------------------------------------------------------------------
+  // 6. TRANSMIT VIA BLE NOTIFY
+  // -----------------------------------------------------------------------
+  if (deviceConnected) {
+    pTelemetryChar->setValue((uint8_t*)&pkt, sizeof(TelemetryPacket));
+    pTelemetryChar->notify();
+  }
+}

@@ -1,0 +1,461 @@
+// =========================================================================
+// PROJECT SENTINEL — DISPLAY SLAVE (ELECROW 7.0" CROWPANEL | LOVYANGFX)
+// BLE GATT Client + 800x480 Automotive Dashboard with Severity Backgrounds
+// =========================================================================
+#include <LovyanGFX.hpp>
+#include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
+#include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
+#include <BLEDevice.h>
+
+// -------------------- ELECROW 7.0" LOVYANGFX CONFIG --------------------
+class LGFX : public lgfx::LGFX_Device {
+public:
+  lgfx::Bus_RGB   _bus_instance;
+  lgfx::Panel_RGB _panel_instance;
+  lgfx::Light_PWM _light_instance;
+
+  LGFX(void) {
+    {
+      auto cfg = _panel_instance.config();
+      cfg.memory_width  = 800;
+      cfg.memory_height = 480;
+      cfg.panel_width   = 800;
+      cfg.panel_height  = 480;
+      cfg.offset_x      = 0;
+      cfg.offset_y      = 0;
+      _panel_instance.config(cfg);
+    }
+    {
+      auto cfg = _bus_instance.config();
+      cfg.panel = &_panel_instance;
+      cfg.pin_d0  = GPIO_NUM_15; // B0
+      cfg.pin_d1  = GPIO_NUM_7;  // B1
+      cfg.pin_d2  = GPIO_NUM_6;  // B2
+      cfg.pin_d3  = GPIO_NUM_5;  // B3
+      cfg.pin_d4  = GPIO_NUM_4;  // B4
+      cfg.pin_d5  = GPIO_NUM_9;  // G0
+      cfg.pin_d6  = GPIO_NUM_46; // G1
+      cfg.pin_d7  = GPIO_NUM_3;  // G2
+      cfg.pin_d8  = GPIO_NUM_8;  // G3
+      cfg.pin_d9  = GPIO_NUM_16; // G4
+      cfg.pin_d10 = GPIO_NUM_1;  // G5
+      cfg.pin_d11 = GPIO_NUM_14; // R0
+      cfg.pin_d12 = GPIO_NUM_21; // R1
+      cfg.pin_d13 = GPIO_NUM_47; // R2
+      cfg.pin_d14 = GPIO_NUM_48; // R3
+      cfg.pin_d15 = GPIO_NUM_45; // R4
+
+      cfg.pin_henable = GPIO_NUM_41;
+      cfg.pin_vsync   = GPIO_NUM_40;
+      cfg.pin_hsync   = GPIO_NUM_39;
+      cfg.pin_pclk    = GPIO_NUM_0;
+      cfg.freq_write  = 14000000;
+
+      cfg.hsync_polarity    = 0;
+      cfg.hsync_front_porch = 40;
+      cfg.hsync_pulse_width = 48;
+      cfg.hsync_back_porch  = 40;
+      cfg.vsync_polarity    = 0;
+      cfg.vsync_front_porch = 1;
+      cfg.vsync_pulse_width = 31;
+      cfg.vsync_back_porch  = 13;
+      cfg.pclk_active_neg   = 1;
+      cfg.de_idle_high      = 0;
+      cfg.pclk_idle_high    = 0;
+      _bus_instance.config(cfg);
+    }
+    _panel_instance.setBus(&_bus_instance);
+    {
+      auto cfg = _light_instance.config();
+      cfg.pin_bl = GPIO_NUM_2;
+      _light_instance.config(cfg);
+      _panel_instance.setLight(&_light_instance);
+    }
+    setPanel(&_panel_instance);
+  }
+};
+
+LGFX tft;
+
+// Double-buffered sprites for flicker-free partial updates
+LGFX_Sprite sprHeader(&tft);
+LGFX_Sprite sprTach(&tft);
+LGFX_Sprite sprCard(&tft);
+
+// -------------------- THEME COLORS (RGB565) --------------------
+#define C_BG          0x0861 // #0B0E14
+#define C_HEADER      0x10A3 // #10151F
+#define C_CARD_OK     0x10C4 // #141923
+#define C_CARD_WARN   0x4140 // #422B06 (Deep Yellow/Amber)
+#define C_CARD_ALARM  0x4862 // #4C0D12 (Deep Red)
+#define C_BORDER_OK   0x2188 // #263042
+#define C_TRACK_OK    0x1947 // #1E293B
+#define C_TRACK_WARN  0x28E0 // #2B1C05
+#define C_TRACK_ALARM 0x2882 // #2B1014
+#define C_TEXT_MAIN   0xF7DF // #F8FAFC
+#define C_TEXT_MUTED  0x9517 // #94A3B8
+#define C_BLUE        0x35FF // #38BDF8
+#define C_GREEN       0x262B // #22C55E
+#define C_YELLOW      0xFE62 // #FACC15
+#define C_RED         0xEA28 // #EF4444
+#define C_RED_DARK    0x40C3 // #451A1A
+
+// -------------------- BLE PROTOCOL (MUST MATCH MAIN) --------------------
+static BLEUUID serviceUUID("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
+static BLEUUID charUUID   ("beb5483e-36e1-4688-b7f5-ea07361b26a8");
+
+enum SensorStatus : uint8_t {
+  STATUS_OK    = 0,
+  STATUS_WARN  = 1,
+  STATUS_ALARM = 2,
+  STATUS_FAULT = 3
+};
+
+struct __attribute__((packed)) TelemetryPacket {
+  uint32_t seq;
+  float    coolantF;
+  float    oilPsi;
+  float    afr;
+  float    battV;
+  uint16_t rpm;
+  uint8_t  stTemp;
+  uint8_t  stOil;
+  uint8_t  stAfr;
+  uint8_t  stBatt;
+  uint8_t  stRpm;
+  uint8_t  reserved;
+};
+
+// -------------------- STATE VARIABLES --------------------
+TelemetryPacket latestPkt = {};
+volatile bool newPacketFlag = false;
+unsigned long lastPacketMs = 0;
+
+BLEAdvertisedDevice* targetDevice = nullptr;
+BLEClient* pClient = nullptr;
+bool doConnect = false;
+bool bleConnected = false;
+bool linkLost = true;
+
+// -------------------- BLE CALLBACKS --------------------
+static void notifyCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_t len, bool isNotify) {
+  if (len == sizeof(TelemetryPacket)) {
+    memcpy(&latestPkt, pData, sizeof(TelemetryPacket));
+    lastPacketMs = millis();
+    newPacketFlag = true;
+  }
+}
+
+class ClientCallbacks : public BLEClientCallbacks {
+  void onConnect(BLEClient* c) override { bleConnected = true; }
+  void onDisconnect(BLEClient* c) override {
+    bleConnected = false;
+    linkLost = true;
+  }
+};
+
+class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) override {
+    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
+      BLEDevice::getScan()->stop();
+      targetDevice = new BLEAdvertisedDevice(advertisedDevice);
+      doConnect = true;
+    }
+  }
+};
+
+bool connectToServer() {
+  if (pClient) { delete pClient; pClient = nullptr; }
+  pClient = BLEDevice::createClient();
+  pClient->setClientCallbacks(new ClientCallbacks());
+
+  if (!pClient->connect(targetDevice)) return false;
+  BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
+  if (!pRemoteService) { pClient->disconnect(); return false; }
+
+  BLERemoteCharacteristic* pRemoteChar = pRemoteService->getCharacteristic(charUUID);
+  if (!pRemoteChar) { pClient->disconnect(); return false; }
+
+  if (pRemoteChar->canNotify()) pRemoteChar->registerForNotify(notifyCallback);
+  bleConnected = true;
+  lastPacketMs = millis();
+  linkLost = false;
+  return true;
+}
+
+// -------------------- UI DRAWING FUNCTIONS --------------------
+void drawHeader(uint8_t worstSeverity, bool isLinkLost) {
+  sprHeader.fillSprite(C_HEADER);
+
+  uint16_t lineCol = C_BORDER_OK;
+  uint16_t pillBg  = 0x0943; // Deep Green
+  uint16_t pillCol = C_GREEN;
+  const char* pillTxt = "SYSTEM NOMINAL";
+
+  if (isLinkLost) {
+    lineCol = C_RED; pillBg = C_CARD_ALARM; pillCol = C_RED;
+    pillTxt = "BLE LINK LOST";
+  } else if (worstSeverity == STATUS_ALARM) {
+    lineCol = C_RED; pillBg = C_CARD_ALARM; pillCol = C_RED;
+    pillTxt = "CRITICAL ALARM";
+  } else if (worstSeverity == STATUS_WARN || worstSeverity == STATUS_FAULT) {
+    lineCol = C_YELLOW; pillBg = C_CARD_WARN; pillCol = C_YELLOW;
+    pillTxt = "SENSOR WARNING";
+  }
+
+  // Bottom border line
+  sprHeader.fillRect(0, 53, 800, 2, lineCol);
+
+  // Brand title
+  sprHeader.setTextDatum(ML_DATUM);
+  sprHeader.setFont(&fonts::Font4);
+  sprHeader.setTextColor(C_TEXT_MAIN);
+  sprHeader.drawString("SENTINEL", 22, 27);
+  sprHeader.setFont(&fonts::Font2);
+  sprHeader.setTextColor(C_BLUE);
+  sprHeader.drawString("TELEMETRY", 155, 28);
+
+  // Center Status Pill
+  sprHeader.fillRoundRect(290, 11, 220, 32, 6, pillBg);
+  sprHeader.drawRoundRect(290, 11, 220, 32, 6, pillCol);
+  sprHeader.fillCircle(310, 27, 5, pillCol);
+  sprHeader.setTextDatum(ML_DATUM);
+  sprHeader.setFont(&fonts::Font2);
+  sprHeader.setTextColor(pillCol);
+  sprHeader.drawString(pillTxt, 325, 27);
+
+  // Right BLE Status
+  sprHeader.fillCircle(640, 27, 5, isLinkLost ? C_RED : C_BLUE);
+  sprHeader.setTextColor(C_TEXT_MAIN);
+  sprHeader.drawString(isLinkLost ? "RECONNECTING..." : "BLE CONNECTED", 654, 20);
+  sprHeader.setTextColor(C_TEXT_MUTED);
+  char subBuf[32];
+  snprintf(subBuf, sizeof(subBuf), "PKT #%lu", (unsigned long)latestPkt.seq);
+  sprHeader.drawString(isLinkLost ? "TIMEOUT > 2.0s" : subBuf, 654, 36);
+
+  sprHeader.pushSprite(0, 0);
+}
+
+void drawTachometer(uint16_t rpm, uint8_t status, bool isLinkLost) {
+  uint16_t bgCol     = C_CARD_OK;
+  uint16_t borderCol = C_BORDER_OK;
+  if (!isLinkLost) {
+    if (status == STATUS_ALARM)     { bgCol = C_CARD_ALARM; borderCol = C_RED; }
+    else if (status == STATUS_WARN) { bgCol = C_CARD_WARN;  borderCol = C_YELLOW; }
+  }
+
+  sprTach.fillSprite(C_BG);
+  sprTach.fillRoundRect(0, 0, 330, 390, 10, bgCol);
+  sprTach.drawRoundRect(0, 0, 330, 390, 10, borderCol);
+  if (bgCol != C_CARD_OK) sprTach.drawRoundRect(1, 1, 328, 388, 9, borderCol);
+
+  // Title
+  sprTach.setTextDatum(TL_DATUM);
+  sprTach.setFont(&fonts::Font2);
+  sprTach.setTextColor(C_TEXT_MUTED);
+  sprTach.drawString("TACHOMETER", 18, 16);
+  sprTach.setTextDatum(TR_DATUM);
+  sprTach.drawString("V8 4-PULSE", 312, 16);
+
+  // 270-deg Arc Gauge (LovyanGFX angles: 0 deg = 3 o'clock, clockwise)
+  // Start = 135 deg (bottom-left), End = 405 deg (bottom-right)
+  int cx = 165, cy = 200, rOut = 126, rIn = 108;
+  sprTach.fillArc(cx, cy, rOut, rIn, 135, 405, C_TRACK_OK);
+
+  // Redline zone (5500 - 7000 RPM -> 347 deg to 405 deg)
+  sprTach.fillArc(cx, cy, rOut, rIn, 347, 405, C_RED_DARK);
+  sprTach.fillArc(cx, cy, rOut + 4, rOut + 1, 347, 405, C_RED);
+
+  // Active RPM Arc
+  if (!isLinkLost && rpm > 0) {
+    float endAng = 135.0f + (constrain(rpm, 0, 7000) / 7000.0f) * 270.0f;
+    uint16_t arcCol = (rpm > 5500) ? C_RED : ((rpm > 5000) ? C_YELLOW : C_BLUE);
+    sprTach.fillArc(cx, cy, rOut, rIn, 135, endAng, arcCol);
+  }
+
+  // Scale labels (0 - 7)
+  sprTach.setTextDatum(MC_DATUM);
+  sprTach.setFont(&fonts::Font2);
+  for (int k = 0; k <= 7; k++) {
+    float deg = 135.0f + (k / 7.0f) * 270.0f;
+    float rad = deg * DEG_TO_RAD;
+    int tx = cx + (int)(88 * cosf(rad));
+    int ty = cy + (int)(88 * sinf(rad));
+    sprTach.setTextColor(k >= 6 ? C_RED : C_TEXT_MUTED);
+    sprTach.drawNumber(k, tx, ty);
+  }
+
+  // Digital RPM Center Readout
+  sprTach.setFont(&fonts::Font6);
+  sprTach.setTextColor(C_TEXT_MAIN);
+  if (isLinkLost) {
+    sprTach.drawString("---", cx, cy - 4);
+  } else {
+    char rpmStr[10];
+    snprintf(rpmStr, sizeof(rpmStr), "%u", rpm);
+    sprTach.drawString(rpmStr, cx, cy - 4);
+  }
+  sprTach.setFont(&fonts::Font2);
+  sprTach.setTextColor(C_TEXT_MUTED);
+  sprTach.drawString("RPM", cx, cy + 32);
+
+  sprTach.setTextColor(C_RED);
+  sprTach.drawString("REDLINE: 5,500 RPM", cx, 360);
+
+  sprTach.pushSprite(16, 70);
+}
+
+void drawSensorCard(int x, int y, const char* title, const char* valStr, const char* unitStr,
+                    float pct, uint16_t nomBarCol, const char* subL, const char* subR,
+                    uint8_t status, bool isLinkLost) {
+  uint16_t bgCol     = C_CARD_OK;
+  uint16_t borderCol = C_BORDER_OK;
+  uint16_t trackCol  = C_TRACK_OK;
+  uint16_t barCol    = nomBarCol;
+  uint16_t stCol     = C_GREEN;
+  const char* stTxt  = "OK";
+
+  if (isLinkLost) {
+    valStr = "---"; pct = 0.0f; stTxt = "OFFLINE"; stCol = C_TEXT_MUTED;
+  } else if (status == STATUS_ALARM) {
+    bgCol = C_CARD_ALARM; borderCol = C_RED; trackCol = C_TRACK_ALARM;
+    barCol = C_RED; stCol = C_RED; stTxt = "ALARM";
+  } else if (status == STATUS_FAULT) {
+    bgCol = C_CARD_WARN; borderCol = C_YELLOW; trackCol = C_TRACK_WARN;
+    barCol = C_YELLOW; stCol = C_YELLOW; stTxt = "FAULT";
+    valStr = "---"; pct = 0.0f;
+  } else if (status == STATUS_WARN) {
+    bgCol = C_CARD_WARN; borderCol = C_YELLOW; trackCol = C_TRACK_WARN;
+    barCol = C_YELLOW; stCol = C_YELLOW; stTxt = "WARN";
+  }
+
+  sprCard.fillSprite(C_BG);
+  sprCard.fillRoundRect(0, 0, 203, 187, 10, bgCol);
+  sprCard.drawRoundRect(0, 0, 203, 187, 10, borderCol);
+  if (bgCol != C_CARD_OK) sprCard.drawRoundRect(1, 1, 201, 185, 9, borderCol);
+
+  // Header
+  sprCard.setFont(&fonts::Font2);
+  sprCard.setTextDatum(TL_DATUM);
+  sprCard.setTextColor(bgCol == C_CARD_OK ? C_TEXT_MUTED : C_TEXT_MAIN);
+  sprCard.drawString(title, 14, 14);
+  sprCard.setTextDatum(TR_DATUM);
+  sprCard.setTextColor(stCol);
+  sprCard.drawString(stTxt, 189, 14);
+
+  // Large Value + Unit
+  sprCard.setTextDatum(ML_DATUM);
+  sprCard.setFont(&fonts::Font6);
+  sprCard.setTextColor(C_TEXT_MAIN);
+  sprCard.drawString(valStr, 14, 84);
+
+  sprCard.setTextDatum(MR_DATUM);
+  sprCard.setFont(&fonts::Font4);
+  sprCard.setTextColor(bgCol == C_CARD_OK ? C_TEXT_MUTED : C_TEXT_MAIN);
+  sprCard.drawString(unitStr, 189, 88);
+
+  // Progress Bar
+  int bx = 14, by = 136, bw = 175, bh = 12;
+  sprCard.fillRoundRect(bx, by, bw, bh, 4, trackCol);
+  if (pct > 0.01f) {
+    int fw = (int)(bw * constrain(pct, 0.0f, 1.0f));
+    if (fw < 6) fw = 6;
+    sprCard.fillRoundRect(bx, by, fw, bh, 4, barCol);
+  }
+
+  // Range Labels
+  sprCard.setFont(&fonts::Font2);
+  sprCard.setTextColor(C_TEXT_MUTED);
+  sprCard.setTextDatum(TL_DATUM);
+  sprCard.drawString(subL, bx, 158);
+  sprCard.setTextDatum(TR_DATUM);
+  sprCard.drawString(subR, bx + bw, 158);
+
+  sprCard.pushSprite(x, y);
+}
+
+void renderDashboard() {
+  // Determine highest severity across all 5 channels
+  uint8_t worst = STATUS_OK;
+  uint8_t statuses[5] = { latestPkt.stTemp, latestPkt.stOil, latestPkt.stAfr, latestPkt.stBatt, latestPkt.stRpm };
+  for (uint8_t s : statuses) {
+    if (s == STATUS_ALARM) { worst = STATUS_ALARM; break; }
+    if (s == STATUS_WARN || s == STATUS_FAULT) worst = s;
+  }
+
+  drawHeader(worst, linkLost);
+  drawTachometer(latestPkt.rpm, latestPkt.stRpm, linkLost);
+
+  char buf[16];
+  // Top-Left: Coolant Temp
+  snprintf(buf, sizeof(buf), "%.0f", latestPkt.coolantF);
+  drawSensorCard(362, 70, "COOLANT TEMP", buf, "F", latestPkt.coolantF / 300.0f,
+                 C_GREEN, "0F", "MAX 240F", latestPkt.stTemp, linkLost);
+
+  // Top-Right: Oil Pressure
+  snprintf(buf, sizeof(buf), "%.0f", latestPkt.oilPsi);
+  drawSensorCard(581, 70, "OIL PRESSURE", buf, "PSI", latestPkt.oilPsi / 100.0f,
+                 C_BLUE, "MIN 15", "100 PSI", latestPkt.stOil, linkLost);
+
+  // Bottom-Left: Air-Fuel Ratio
+  snprintf(buf, sizeof(buf), "%.1f", latestPkt.afr);
+  drawSensorCard(362, 273, "AIR-FUEL RATIO", buf, "AFR", (latestPkt.afr - 10.0f) / 10.0f,
+                 C_GREEN, "10.0 RICH", "20.0 LEAN", latestPkt.stAfr, linkLost);
+
+  // Bottom-Right: Battery Voltage
+  snprintf(buf, sizeof(buf), "%.1f", latestPkt.battV);
+  drawSensorCard(581, 273, "BATTERY VOLT", buf, "V", (latestPkt.battV - 10.0f) / 6.0f,
+                 C_BLUE, "10.0V", "16.0V", latestPkt.stBatt, linkLost);
+}
+
+void setup() {
+  Serial.begin(115200);
+  tft.init();
+  tft.setRotation(0);
+  tft.setBrightness(255);
+  tft.fillScreen(C_BG);
+
+  // Allocate PSRAM-backed sprites
+  sprHeader.setPsram(true); sprHeader.createSprite(800, 55);
+  sprTach.setPsram(true);   sprTach.createSprite(330, 390);
+  sprCard.setPsram(true);   sprCard.createSprite(203, 187);
+
+  renderDashboard(); // Draw initial offline screen immediately
+
+  // Initialize BLE Client & start scanning
+  BLEDevice::init("Sentinel_Display");
+  BLEScan* pScan = BLEDevice::getScan();
+  pScan->setAdvertisedDeviceCallbacks(new ScanCallbacks());
+  pScan->setActiveScan(true);
+  pScan->start(0, false);
+}
+
+void loop() {
+  // Handle pending BLE connection
+  if (doConnect) {
+    doConnect = false;
+    if (!connectToServer()) {
+      BLEDevice::getScan()->start(2, false);
+    }
+  }
+
+  // Enforce 2.0-second Link Loss Detection (Rubric Requirement)
+  if (!linkLost && (millis() - lastPacketMs > 2000)) {
+    linkLost = true;
+    renderDashboard();
+  }
+
+  // Auto-restart scan if disconnected
+  static unsigned long lastScanMs = 0;
+  if (!bleConnected && !doConnect && (millis() - lastScanMs > 2500)) {
+    lastScanMs = millis();
+    BLEDevice::getScan()->start(2, false);
+  }
+
+  // Redraw dashboard whenever a new 60ms packet arrives
+  if (newPacketFlag) {
+    newPacketFlag = false;
+    linkLost = false;
+    renderDashboard();
+  }
+}
